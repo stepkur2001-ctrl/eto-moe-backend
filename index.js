@@ -15,6 +15,14 @@ if (!BOT_TOKEN) {
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use((req, res, next) => {
+  console.log(
+    new Date().toISOString(),
+    req.method,
+    req.path
+  );
+  next();
+});
 
 // =========================================================
 // БЛОК 1. TELEGRAM AUTH
