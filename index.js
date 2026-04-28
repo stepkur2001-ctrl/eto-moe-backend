@@ -229,6 +229,72 @@ function normalizePoints(points) {
       Number.isFinite(p.lon)
     );
 }
+function makeCellKey(center, size, gridSizeMeters, cellIndex) {
+  return [
+    center.lat.toFixed(6),
+    center.lon.toFixed(6),
+    size,
+    gridSizeMeters,
+    cellIndex
+  ].join(':');
+}
+
+async function findOrCreateUser(client, telegramUser) {
+  const telegramId = telegramUser?.id;
+
+  if (!telegramId) {
+    throw new Error('telegram user id is missing');
+  }
+
+  const existing = await client.query(
+    `
+      select id, telegram_id, username, first_name, last_name
+      from users
+      where telegram_id = $1
+      limit 1
+    `,
+    [telegramId]
+  );
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0];
+
+    await client.query(
+      `
+        update users
+        set
+          username = $2,
+          first_name = $3,
+          last_name = $4
+        where id = $1
+      `,
+      [
+        row.id,
+        telegramUser.username ?? null,
+        telegramUser.first_name ?? null,
+        telegramUser.last_name ?? null
+      ]
+    );
+
+    return row.id;
+  }
+
+  const inserted = await client.query(
+    `
+      insert into users (telegram_id, username, first_name, last_name)
+      values ($1, $2, $3, $4)
+      returning id
+    `,
+    [
+      telegramId,
+      telegramUser.username ?? null,
+      telegramUser.first_name ?? null,
+      telegramUser.last_name ?? null
+    ]
+  );
+
+  return inserted.rows[0].id;
+}
 
 // =========================================================
 // БЛОК 5. HEALTHCHECK
@@ -268,97 +334,190 @@ app.post('/api/auth/telegram', (req, res) => {
 // БЛОК 7. STAGE 3.2A FINISH RUN
 // Сервер принимает маршрут и считает summary
 // =========================================================
-app.post('/api/runs/finish', (req, res) => {
-  const { initData, routeCenter, grid, points } = req.body || {};
+app.post('/api/runs/finish', async (req, res) => {
+  const client = await pool.connect();
 
-  // 1. Проверяем Telegram-пользователя
-  const auth = validateTelegramInitData(initData, BOT_TOKEN);
-  if (!auth.ok) {
-    return res.status(401).json(auth);
-  }
+  try {
+    const { initData, routeCenter, grid, points, durationSeconds } = req.body || {};
 
-  // 2. Проверяем центр карты
-  const center = {
-    lat: Number(routeCenter?.lat),
-    lon: Number(routeCenter?.lon)
-  };
+    // 1. Проверяем Telegram-пользователя
+    const auth = validateTelegramInitData(initData, BOT_TOKEN);
+    if (!auth.ok) {
+      return res.status(401).json(auth);
+    }
 
-  if (!Number.isFinite(center.lat) || !Number.isFinite(center.lon)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'routeCenter is invalid'
+    // 2. Проверяем центр карты
+    const center = {
+      lat: Number(routeCenter?.lat),
+      lon: Number(routeCenter?.lon)
+    };
+
+    if (!Number.isFinite(center.lat) || !Number.isFinite(center.lon)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'routeCenter is invalid'
+      });
+    }
+
+    // 3. Проверяем сетку
+    const size = Number(grid?.size);
+    const gridSizeMeters = Number(grid?.gridSizeMeters);
+
+    if (!Number.isFinite(size) || size <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'grid.size is invalid'
+      });
+    }
+
+    if (!Number.isFinite(gridSizeMeters) || gridSizeMeters <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'grid.gridSizeMeters is invalid'
+      });
+    }
+
+    // 4. Нормализуем точки
+    const safePoints = normalizePoints(points);
+
+    if (safePoints.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'points are missing or invalid'
+      });
+    }
+
+    // 5. Считаем distance и route
+    const distanceMeters = Math.round(totalDistanceMeters(safePoints));
+    const route = uniqueOrderedCellRoute(
+      safePoints,
+      center,
+      size,
+      gridSizeMeters
+    );
+
+    const runDurationSeconds = Number.isFinite(Number(durationSeconds))
+      ? Number(durationSeconds)
+      : 0;
+
+    await client.query('begin');
+
+    // 6. Находим или создаём пользователя
+    const userId = await findOrCreateUser(client, auth.user);
+
+    // 7. Обновляем владение клетками
+    let fromFree = 0;
+    let fromEnemy1 = 0;
+    let fromEnemy2 = 0;
+    let alreadyMine = 0;
+    let captured = 0;
+
+    for (const cellIndex of route) {
+      const cellKey = makeCellKey(center, size, gridSizeMeters, cellIndex);
+
+      const existingOwner = await client.query(
+        `
+          select owner_user_id
+          from cell_ownership
+          where cell_key = $1
+          limit 1
+        `,
+        [cellKey]
+      );
+
+      if (existingOwner.rows.length === 0) {
+        fromFree += 1;
+        captured += 1;
+
+        await client.query(
+          `
+            insert into cell_ownership (cell_key, owner_user_id, updated_at)
+            values ($1, $2, now())
+          `,
+          [cellKey, userId]
+        );
+      } else {
+        const ownerUserId = existingOwner.rows[0].owner_user_id;
+
+        if (ownerUserId === userId) {
+          alreadyMine += 1;
+        } else {
+          captured += 1;
+          fromEnemy1 += 1; // временно считаем всех чужих как enemy1
+
+          await client.query(
+            `
+              update cell_ownership
+              set owner_user_id = $2,
+                  updated_at = now()
+              where cell_key = $1
+            `,
+            [cellKey, userId]
+          );
+        }
+      }
+    }
+
+    // 8. Пишем запись о пробежке
+    const insertedRun = await client.query(
+      `
+        insert into runs (
+          user_id,
+          distance_meters,
+          points_count,
+          route_cells_count,
+          captured_count,
+          duration_seconds,
+          started_at,
+          finished_at
+        )
+        values ($1, $2, $3, $4, $5, $6, null, now())
+        returning id
+      `,
+      [
+        userId,
+        distanceMeters,
+        safePoints.length,
+        route.length,
+        captured,
+        runDurationSeconds
+      ]
+    );
+
+    await client.query('commit');
+
+    return res.json({
+      ok: true,
+      runId: insertedRun.rows[0].id,
+      user: {
+        telegramId: auth.user?.id ?? null,
+        firstName: auth.user?.first_name ?? null,
+        username: auth.user?.username ?? null
+      },
+      summary: {
+        pointsCount: safePoints.length,
+        routeCells: route.length,
+        captured,
+        fromFree,
+        fromEnemy1,
+        fromEnemy2,
+        alreadyMine,
+        distanceMeters,
+        durationSeconds: runDurationSeconds
+      },
+      route
     });
-  }
+  } catch (error) {
+    await client.query('rollback');
+    console.error('finish-run db error:', error);
 
-  // 3. Проверяем настройки сетки
-  const size = Number(grid?.size);
-  const gridSizeMeters = Number(grid?.gridSizeMeters);
-
-  if (!Number.isFinite(size) || size <= 0) {
-    return res.status(400).json({
+    return res.status(500).json({
       ok: false,
-      error: 'grid.size is invalid'
+      error: error.message
     });
+  } finally {
+    client.release();
   }
-
-  if (!Number.isFinite(gridSizeMeters) || gridSizeMeters <= 0) {
-    return res.status(400).json({
-      ok: false,
-      error: 'grid.gridSizeMeters is invalid'
-    });
-  }
-
-  // 4. Нормализуем точки
-  const safePoints = normalizePoints(points);
-
-  if (safePoints.length === 0) {
-    return res.status(400).json({
-      ok: false,
-      error: 'points are missing or invalid'
-    });
-  }
-
-  // 5. Считаем дистанцию
-  const distanceMeters = totalDistanceMeters(safePoints);
-
-  // 6. Считаем клетки маршрута
-  const route = uniqueOrderedCellRoute(
-    safePoints,
-    center,
-    size,
-    gridSizeMeters
-  );
-
-  // 7. Пока без базы:
-  // считаем, что каждая клетка маршрута = "новая"
-  const routeCells = route.length;
-  const captured = route.length;
-  const alreadyMine = 0;
-  const fromFree = route.length;
-  const fromEnemy1 = 0;
-  const fromEnemy2 = 0;
-
-  const user = auth.user || {};
-
-  return res.json({
-    ok: true,
-    user: {
-      telegramId: user.id ?? null,
-      firstName: user.first_name ?? null,
-      username: user.username ?? null
-    },
-    summary: {
-      pointsCount: safePoints.length,
-      routeCells,
-      captured,
-      fromFree,
-      fromEnemy1,
-      fromEnemy2,
-      alreadyMine,
-      distanceMeters: Math.round(distanceMeters)
-    },
-    route
-  });
 });
 
 // =========================================================
