@@ -364,6 +364,24 @@ app.post('/api/runs/finish', (req, res) => {
 // =========================================================
 // БЛОК 8. СТАРТ СЕРВЕРА
 // =========================================================
+app.get('/api/db-check', async (_req, res) => {
+  try {
+    const result = await pool.query('select now() as now');
+
+    res.json({
+      ok: true,
+      db: 'connected',
+      now: result.rows[0].now
+    });
+  } catch (error) {
+    console.error('db-check error:', error);
+
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
