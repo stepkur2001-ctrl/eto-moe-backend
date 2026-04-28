@@ -15,17 +15,19 @@ if (!DATABASE_URL) {
   throw new Error('DATABASE_URL is required');
 }
 
+if (!BOT_TOKEN) {
+  throw new Error('BOT_TOKEN is required in .env');
+}
+
 const { Pool } = pg;
 
 const pool = new Pool({
   connectionString: DATABASE_URL
 });
-if (!BOT_TOKEN) {
-  throw new Error('BOT_TOKEN is required in .env');
-}
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+
 app.use((req, res, next) => {
   console.log(
     new Date().toISOString(),
@@ -37,7 +39,6 @@ app.use((req, res, next) => {
 
 // =========================================================
 // БЛОК 1. TELEGRAM AUTH
-// Проверяем, что initData действительно пришел от Telegram
 // =========================================================
 function buildDataCheckString(params) {
   return [...params.entries()]
@@ -112,7 +113,6 @@ function validateTelegramInitData(initData, botToken, maxAgeSeconds = 3600) {
 
 // =========================================================
 // БЛОК 2. МАТЕМАТИКА МАРШРУТА
-// Сервер сам считает дистанцию
 // =========================================================
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -146,7 +146,6 @@ function totalDistanceMeters(points) {
 
 // =========================================================
 // БЛОК 3. ГЕОМЕТРИЯ СЕТКИ
-// Сервер сам переводит GPS-точки в клетки
 // =========================================================
 function gridGeometry(center, size, gridSizeMeters) {
   const metersPerDegLat = 111320;
@@ -213,7 +212,7 @@ function uniqueOrderedCellRoute(points, center, size, gridSizeMeters) {
 }
 
 // =========================================================
-// БЛОК 4. ВСПОМОГАТЕЛЬНАЯ ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ
+// БЛОК 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // =========================================================
 function normalizePoints(points) {
   if (!Array.isArray(points)) return [];
@@ -229,6 +228,7 @@ function normalizePoints(points) {
       Number.isFinite(p.lon)
     );
 }
+
 function makeCellKey(center, size, gridSizeMeters, cellIndex) {
   return [
     center.lat.toFixed(6),
@@ -331,8 +331,7 @@ app.post('/api/auth/telegram', (req, res) => {
 });
 
 // =========================================================
-// БЛОК 7. STAGE 3.2A FINISH RUN
-// Сервер принимает маршрут и считает summary
+// БЛОК 7. STAGE 3.3D FINISH RUN + DB
 // =========================================================
 app.post('/api/runs/finish', async (req, res) => {
   const client = await pool.connect();
@@ -340,13 +339,11 @@ app.post('/api/runs/finish', async (req, res) => {
   try {
     const { initData, routeCenter, grid, points, durationSeconds } = req.body || {};
 
-    // 1. Проверяем Telegram-пользователя
     const auth = validateTelegramInitData(initData, BOT_TOKEN);
     if (!auth.ok) {
       return res.status(401).json(auth);
     }
 
-    // 2. Проверяем центр карты
     const center = {
       lat: Number(routeCenter?.lat),
       lon: Number(routeCenter?.lon)
@@ -359,7 +356,6 @@ app.post('/api/runs/finish', async (req, res) => {
       });
     }
 
-    // 3. Проверяем сетку
     const size = Number(grid?.size);
     const gridSizeMeters = Number(grid?.gridSizeMeters);
 
@@ -377,7 +373,6 @@ app.post('/api/runs/finish', async (req, res) => {
       });
     }
 
-    // 4. Нормализуем точки
     const safePoints = normalizePoints(points);
 
     if (safePoints.length === 0) {
@@ -387,7 +382,6 @@ app.post('/api/runs/finish', async (req, res) => {
       });
     }
 
-    // 5. Считаем distance и route
     const distanceMeters = Math.round(totalDistanceMeters(safePoints));
     const route = uniqueOrderedCellRoute(
       safePoints,
@@ -402,10 +396,8 @@ app.post('/api/runs/finish', async (req, res) => {
 
     await client.query('begin');
 
-    // 6. Находим или создаём пользователя
     const userId = await findOrCreateUser(client, auth.user);
 
-    // 7. Обновляем владение клетками
     let fromFree = 0;
     let fromEnemy1 = 0;
     let fromEnemy2 = 0;
@@ -439,11 +431,11 @@ app.post('/api/runs/finish', async (req, res) => {
       } else {
         const ownerUserId = existingOwner.rows[0].owner_user_id;
 
-        if (ownerUserId === userId) {
+        if (Number(ownerUserId) === Number(userId)) {
           alreadyMine += 1;
         } else {
           captured += 1;
-          fromEnemy1 += 1; // временно считаем всех чужих как enemy1
+          fromEnemy1 += 1;
 
           await client.query(
             `
@@ -458,7 +450,6 @@ app.post('/api/runs/finish', async (req, res) => {
       }
     }
 
-    // 8. Пишем запись о пробежке
     const insertedRun = await client.query(
       `
         insert into runs (
@@ -521,7 +512,87 @@ app.post('/api/runs/finish', async (req, res) => {
 });
 
 // =========================================================
-// БЛОК 8. СТАРТ СЕРВЕРА
+// БЛОК 8. STAGE 3.3E MAP STATE
+// =========================================================
+app.get('/api/map/state', async (req, res) => {
+  try {
+    const center = {
+      lat: Number(req.query.lat),
+      lon: Number(req.query.lon)
+    };
+
+    const size = Number(req.query.size);
+    const gridSizeMeters = Number(req.query.gridSizeMeters);
+
+    if (!Number.isFinite(center.lat) || !Number.isFinite(center.lon)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'lat/lon are invalid'
+      });
+    }
+
+    if (!Number.isFinite(size) || size <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'size is invalid'
+      });
+    }
+
+    if (!Number.isFinite(gridSizeMeters) || gridSizeMeters <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'gridSizeMeters is invalid'
+      });
+    }
+
+    const cellKeys = [];
+    const keyToIndex = new Map();
+
+    for (let cellIndex = 0; cellIndex < size * size; cellIndex++) {
+      const cellKey = makeCellKey(center, size, gridSizeMeters, cellIndex);
+      cellKeys.push(cellKey);
+      keyToIndex.set(cellKey, cellIndex);
+    }
+
+    const result = await pool.query(
+      `
+        select
+          co.cell_key,
+          co.owner_user_id,
+          u.telegram_id
+        from cell_ownership co
+        left join users u on u.id = co.owner_user_id
+        where co.cell_key = any($1::text[])
+      `,
+      [cellKeys]
+    );
+
+    const cells = result.rows
+      .map((row) => ({
+        cellIndex: keyToIndex.get(row.cell_key),
+        ownerTelegramId: row.telegram_id
+      }))
+      .filter((row) => Number.isInteger(row.cellIndex));
+
+    return res.json({
+      ok: true,
+      center,
+      size,
+      gridSizeMeters,
+      cells
+    });
+  } catch (error) {
+    console.error('map-state error:', error);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+// =========================================================
+// БЛОК 9. DB CHECK
 // =========================================================
 app.get('/api/db-check', async (_req, res) => {
   try {
@@ -541,6 +612,11 @@ app.get('/api/db-check', async (_req, res) => {
     });
   }
 });
+
+// =========================================================
+// БЛОК 10. DB INIT
+// Временно. Потом лучше удалить.
+// =========================================================
 app.get('/api/db-init', async (_req, res) => {
   try {
     await pool.query(`
@@ -590,6 +666,10 @@ app.get('/api/db-init', async (_req, res) => {
     });
   }
 });
+
+// =========================================================
+// БЛОК 11. СТАРТ СЕРВЕРА
+// =========================================================
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
