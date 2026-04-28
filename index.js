@@ -382,6 +382,55 @@ app.get('/api/db-check', async (_req, res) => {
     });
   }
 });
+app.post('/api/db-init', async (_req, res) => {
+  try {
+    await pool.query(`
+      create table if not exists users (
+        id bigserial primary key,
+        telegram_id bigint unique not null,
+        username text,
+        first_name text,
+        last_name text,
+        created_at timestamptz default now()
+      );
+    `);
+
+    await pool.query(`
+      create table if not exists runs (
+        id bigserial primary key,
+        user_id bigint not null references users(id),
+        distance_meters integer not null default 0,
+        points_count integer not null default 0,
+        route_cells_count integer not null default 0,
+        captured_count integer not null default 0,
+        duration_seconds integer not null default 0,
+        started_at timestamptz,
+        finished_at timestamptz default now(),
+        created_at timestamptz default now()
+      );
+    `);
+
+    await pool.query(`
+      create table if not exists cell_ownership (
+        cell_key text primary key,
+        owner_user_id bigint references users(id),
+        updated_at timestamptz default now()
+      );
+    `);
+
+    res.json({
+      ok: true,
+      message: 'tables created'
+    });
+  } catch (error) {
+    console.error('db-init error:', error);
+
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
