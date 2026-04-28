@@ -9,7 +9,17 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
 
+if (!DATABASE_URL) {
+  throw new Error('DATABASE_URL is required');
+}
+
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: DATABASE_URL
+});
 if (!BOT_TOKEN) {
   throw new Error('BOT_TOKEN is required in .env');
 }
