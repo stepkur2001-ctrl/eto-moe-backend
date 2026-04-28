@@ -382,7 +382,7 @@ app.get('/api/db-check', async (_req, res) => {
     });
   }
 });
-app.post('/api/db-init', async (_req, res) => {
+app.get('/api/db-init', async (_req, res) => {
   try {
     await pool.query(`
       create table if not exists users (
