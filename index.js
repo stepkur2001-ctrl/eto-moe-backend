@@ -16,7 +16,7 @@ if (!DATABASE_URL) {
 }
 
 if (!BOT_TOKEN) {
-  throw new Error('BOT_TOKEN is required in .env');
+  throw new Error('BOT_TOKEN is required');
 }
 
 const { Pool } = pg;
@@ -26,14 +26,10 @@ const pool = new Pool({
 });
 
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 app.use((req, res, next) => {
-  console.log(
-    new Date().toISOString(),
-    req.method,
-    req.path
-  );
+  console.log(new Date().toISOString(), req.method, req.path);
   next();
 });
 
@@ -112,7 +108,7 @@ function validateTelegramInitData(initData, botToken, maxAgeSeconds = 3600) {
 }
 
 // =========================================================
-// БЛОК 2. МАТЕМАТИКА МАРШРУТА
+// БЛОК 2. ОБЩАЯ МАТЕМАТИКА
 // =========================================================
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -144,76 +140,6 @@ function totalDistanceMeters(points) {
   return dist;
 }
 
-// =========================================================
-// БЛОК 3. ГЕОМЕТРИЯ СЕТКИ
-// =========================================================
-function gridGeometry(center, size, gridSizeMeters) {
-  const metersPerDegLat = 111320;
-  const metersPerDegLon = 111320 * Math.cos(center.lat * Math.PI / 180);
-
-  const half = gridSizeMeters / 2;
-  const topLat = center.lat + (half / metersPerDegLat);
-  const bottomLat = center.lat - (half / metersPerDegLat);
-  const leftLon = center.lon - (half / metersPerDegLon);
-  const rightLon = center.lon + (half / metersPerDegLon);
-
-  const cellHeightDeg = (topLat - bottomLat) / size;
-  const cellWidthDeg = (rightLon - leftLon) / size;
-
-  return {
-    topLat,
-    bottomLat,
-    leftLon,
-    rightLon,
-    cellHeightDeg,
-    cellWidthDeg
-  };
-}
-
-function pointToCellIndex(point, center, size, gridSizeMeters) {
-  const g = gridGeometry(center, size, gridSizeMeters);
-
-  if (
-    point.lat > g.topLat ||
-    point.lat < g.bottomLat ||
-    point.lon < g.leftLon ||
-    point.lon > g.rightLon
-  ) {
-    return null;
-  }
-
-  const row = Math.min(
-    size - 1,
-    Math.max(0, Math.floor((g.topLat - point.lat) / g.cellHeightDeg))
-  );
-
-  const col = Math.min(
-    size - 1,
-    Math.max(0, Math.floor((point.lon - g.leftLon) / g.cellWidthDeg))
-  );
-
-  return row * size + col;
-}
-
-function uniqueOrderedCellRoute(points, center, size, gridSizeMeters) {
-  const route = [];
-  const seen = new Set();
-
-  points.forEach((point) => {
-    const cellIndex = pointToCellIndex(point, center, size, gridSizeMeters);
-    if (cellIndex === null) return;
-    if (seen.has(cellIndex)) return;
-
-    seen.add(cellIndex);
-    route.push(cellIndex);
-  });
-
-  return route;
-}
-
-// =========================================================
-// БЛОК 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// =========================================================
 function normalizePoints(points) {
   if (!Array.isArray(points)) return [];
 
@@ -225,20 +151,73 @@ function normalizePoints(points) {
     }))
     .filter((p) =>
       Number.isFinite(p.lat) &&
-      Number.isFinite(p.lon)
+      Number.isFinite(p.lon) &&
+      p.lat >= -85 &&
+      p.lat <= 85 &&
+      p.lon >= -180 &&
+      p.lon <= 180
     );
 }
 
-function makeCellKey(center, size, gridSizeMeters, cellIndex) {
-  return [
-    center.lat.toFixed(6),
-    center.lon.toFixed(6),
-    size,
-    gridSizeMeters,
-    cellIndex
-  ].join(':');
+// =========================================================
+// БЛОК 3. ГЛОБАЛЬНАЯ СЕТКА ЧЕРЕЗ WEB MERCATOR
+// =========================================================
+const EARTH_RADIUS = 6378137;
+const DEFAULT_CELL_SIZE_METERS = 1000;
+
+function lonToMercatorX(lon) {
+  return EARTH_RADIUS * (lon * Math.PI / 180);
 }
 
+function latToMercatorY(lat) {
+  const clamped = Math.max(-85.05112878, Math.min(85.05112878, lat));
+  const rad = clamped * Math.PI / 180;
+  return EARTH_RADIUS * Math.log(Math.tan(Math.PI / 4 + rad / 2));
+}
+
+function pointToGlobalCell(point, cellSizeMeters) {
+  const x = lonToMercatorX(point.lon);
+  const y = latToMercatorY(point.lat);
+
+  return {
+    gridX: Math.floor(x / cellSizeMeters),
+    gridY: Math.floor(y / cellSizeMeters)
+  };
+}
+
+function uniqueOrderedGlobalRoute(points, cellSizeMeters) {
+  const route = [];
+  const seen = new Set();
+
+  for (const point of points) {
+    const cell = pointToGlobalCell(point, cellSizeMeters);
+    const key = `${cell.gridX}:${cell.gridY}`;
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    route.push(cell);
+  }
+
+  return route;
+}
+
+function boundsToGridRange(minLat, maxLat, minLon, maxLon, cellSizeMeters) {
+  const minX = Math.floor(lonToMercatorX(minLon) / cellSizeMeters);
+  const maxX = Math.floor(lonToMercatorX(maxLon) / cellSizeMeters);
+  const minY = Math.floor(latToMercatorY(minLat) / cellSizeMeters);
+  const maxY = Math.floor(latToMercatorY(maxLat) / cellSizeMeters);
+
+  return {
+    minGridX: Math.min(minX, maxX),
+    maxGridX: Math.max(minX, maxX),
+    minGridY: Math.min(minY, maxY),
+    maxGridY: Math.max(minY, maxY)
+  };
+}
+
+// =========================================================
+// БЛОК 4. USERS
+// =========================================================
 async function findOrCreateUser(client, telegramUser) {
   const telegramId = telegramUser?.id;
 
@@ -248,7 +227,7 @@ async function findOrCreateUser(client, telegramUser) {
 
   const existing = await client.query(
     `
-      select id, telegram_id, username, first_name, last_name
+      select id
       from users
       where telegram_id = $1
       limit 1
@@ -257,7 +236,7 @@ async function findOrCreateUser(client, telegramUser) {
   );
 
   if (existing.rows.length > 0) {
-    const row = existing.rows[0];
+    const userId = existing.rows[0].id;
 
     await client.query(
       `
@@ -269,14 +248,14 @@ async function findOrCreateUser(client, telegramUser) {
         where id = $1
       `,
       [
-        row.id,
+        userId,
         telegramUser.username ?? null,
         telegramUser.first_name ?? null,
         telegramUser.last_name ?? null
       ]
     );
 
-    return row.id;
+    return userId;
   }
 
   const inserted = await client.query(
@@ -297,18 +276,14 @@ async function findOrCreateUser(client, telegramUser) {
 }
 
 // =========================================================
-// БЛОК 5. HEALTHCHECK
+// БЛОК 5. BASIC ENDPOINTS
 // =========================================================
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'eto-moe-auth' });
+  res.json({ ok: true, service: 'eto-moe-auth-global' });
 });
 
-// =========================================================
-// БЛОК 6. STAGE 3.1 AUTH
-// =========================================================
 app.post('/api/auth/telegram', (req, res) => {
   const { initData } = req.body || {};
-
   const result = validateTelegramInitData(initData, BOT_TOKEN);
 
   if (!result.ok) {
@@ -330,51 +305,103 @@ app.post('/api/auth/telegram', (req, res) => {
   });
 });
 
+app.get('/api/db-check', async (_req, res) => {
+  try {
+    const result = await pool.query('select now() as now');
+    res.json({
+      ok: true,
+      db: 'connected',
+      now: result.rows[0].now
+    });
+  } catch (error) {
+    console.error('db-check error:', error);
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
 // =========================================================
-// БЛОК 7. STAGE 3.3D FINISH RUN + DB
+// БЛОК 6. GLOBAL DB INIT
+// Один раз вызвать в браузере
 // =========================================================
-app.post('/api/runs/finish', async (req, res) => {
+app.get('/api/db-init-global', async (_req, res) => {
+  try {
+    await pool.query(`
+      create table if not exists users (
+        id bigserial primary key,
+        telegram_id bigint unique not null,
+        username text,
+        first_name text,
+        last_name text,
+        created_at timestamptz default now()
+      );
+    `);
+
+    await pool.query(`
+      create table if not exists runs (
+        id bigserial primary key,
+        user_id bigint not null references users(id),
+        distance_meters integer not null default 0,
+        points_count integer not null default 0,
+        route_cells_count integer not null default 0,
+        captured_count integer not null default 0,
+        duration_seconds integer not null default 0,
+        started_at timestamptz,
+        finished_at timestamptz default now(),
+        created_at timestamptz default now()
+      );
+    `);
+
+    await pool.query(`
+      create table if not exists global_cell_ownership (
+        grid_x bigint not null,
+        grid_y bigint not null,
+        owner_user_id bigint references users(id),
+        updated_at timestamptz default now(),
+        primary key (grid_x, grid_y)
+      );
+    `);
+
+    await pool.query(`
+      create index if not exists idx_global_cell_ownership_owner
+      on global_cell_ownership(owner_user_id);
+    `);
+
+    res.json({
+      ok: true,
+      message: 'global tables created'
+    });
+  } catch (error) {
+    console.error('db-init-global error:', error);
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+// =========================================================
+// БЛОК 7. GLOBAL FINISH RUN
+// =========================================================
+app.post('/api/runs/finish-global', async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { initData, routeCenter, grid, points, durationSeconds } = req.body || {};
+    const {
+      initData,
+      points,
+      durationSeconds,
+      cellSizeMeters
+    } = req.body || {};
 
     const auth = validateTelegramInitData(initData, BOT_TOKEN);
     if (!auth.ok) {
       return res.status(401).json(auth);
     }
 
-    const center = {
-      lat: Number(routeCenter?.lat),
-      lon: Number(routeCenter?.lon)
-    };
-
-    if (!Number.isFinite(center.lat) || !Number.isFinite(center.lon)) {
-      return res.status(400).json({
-        ok: false,
-        error: 'routeCenter is invalid'
-      });
-    }
-
-    const size = Number(grid?.size);
-    const gridSizeMeters = Number(grid?.gridSizeMeters);
-
-    if (!Number.isFinite(size) || size <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'grid.size is invalid'
-      });
-    }
-
-    if (!Number.isFinite(gridSizeMeters) || gridSizeMeters <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'grid.gridSizeMeters is invalid'
-      });
-    }
-
     const safePoints = normalizePoints(points);
-
     if (safePoints.length === 0) {
       return res.status(400).json({
         ok: false,
@@ -382,14 +409,12 @@ app.post('/api/runs/finish', async (req, res) => {
       });
     }
 
-    const distanceMeters = Math.round(totalDistanceMeters(safePoints));
-    const route = uniqueOrderedCellRoute(
-      safePoints,
-      center,
-      size,
-      gridSizeMeters
-    );
+    const safeCellSize = Number.isFinite(Number(cellSizeMeters)) && Number(cellSizeMeters) > 0
+      ? Number(cellSizeMeters)
+      : DEFAULT_CELL_SIZE_METERS;
 
+    const route = uniqueOrderedGlobalRoute(safePoints, safeCellSize);
+    const distanceMeters = Math.round(totalDistanceMeters(safePoints));
     const runDurationSeconds = Number.isFinite(Number(durationSeconds))
       ? Number(durationSeconds)
       : 0;
@@ -399,22 +424,19 @@ app.post('/api/runs/finish', async (req, res) => {
     const userId = await findOrCreateUser(client, auth.user);
 
     let fromFree = 0;
-    let fromEnemy1 = 0;
-    let fromEnemy2 = 0;
+    let fromEnemy = 0;
     let alreadyMine = 0;
     let captured = 0;
 
-    for (const cellIndex of route) {
-      const cellKey = makeCellKey(center, size, gridSizeMeters, cellIndex);
-
+    for (const cell of route) {
       const existingOwner = await client.query(
         `
           select owner_user_id
-          from cell_ownership
-          where cell_key = $1
+          from global_cell_ownership
+          where grid_x = $1 and grid_y = $2
           limit 1
         `,
-        [cellKey]
+        [cell.gridX, cell.gridY]
       );
 
       if (existingOwner.rows.length === 0) {
@@ -423,10 +445,10 @@ app.post('/api/runs/finish', async (req, res) => {
 
         await client.query(
           `
-            insert into cell_ownership (cell_key, owner_user_id, updated_at)
-            values ($1, $2, now())
+            insert into global_cell_ownership (grid_x, grid_y, owner_user_id, updated_at)
+            values ($1, $2, $3, now())
           `,
-          [cellKey, userId]
+          [cell.gridX, cell.gridY, userId]
         );
       } else {
         const ownerUserId = existingOwner.rows[0].owner_user_id;
@@ -434,17 +456,17 @@ app.post('/api/runs/finish', async (req, res) => {
         if (Number(ownerUserId) === Number(userId)) {
           alreadyMine += 1;
         } else {
+          fromEnemy += 1;
           captured += 1;
-          fromEnemy1 += 1;
 
           await client.query(
             `
-              update cell_ownership
-              set owner_user_id = $2,
+              update global_cell_ownership
+              set owner_user_id = $3,
                   updated_at = now()
-              where cell_key = $1
+              where grid_x = $1 and grid_y = $2
             `,
-            [cellKey, userId]
+            [cell.gridX, cell.gridY, userId]
           );
         }
       }
@@ -480,27 +502,22 @@ app.post('/api/runs/finish', async (req, res) => {
     return res.json({
       ok: true,
       runId: insertedRun.rows[0].id,
-      user: {
-        telegramId: auth.user?.id ?? null,
-        firstName: auth.user?.first_name ?? null,
-        username: auth.user?.username ?? null
-      },
       summary: {
         pointsCount: safePoints.length,
         routeCells: route.length,
         captured,
         fromFree,
-        fromEnemy1,
-        fromEnemy2,
+        fromEnemy,
         alreadyMine,
         distanceMeters,
-        durationSeconds: runDurationSeconds
+        durationSeconds: runDurationSeconds,
+        cellSizeMeters: safeCellSize
       },
       route
     });
   } catch (error) {
     await client.query('rollback');
-    console.error('finish-run db error:', error);
+    console.error('finish-global error:', error);
 
     return res.status(500).json({
       ok: false,
@@ -512,78 +529,71 @@ app.post('/api/runs/finish', async (req, res) => {
 });
 
 // =========================================================
-// БЛОК 8. STAGE 3.3E MAP STATE
+// БЛОК 8. VIEWPORT MAP
 // =========================================================
-app.get('/api/map/state', async (req, res) => {
+app.get('/api/map/viewport', async (req, res) => {
   try {
-    const center = {
-      lat: Number(req.query.lat),
-      lon: Number(req.query.lon)
-    };
+    const minLat = Number(req.query.minLat);
+    const maxLat = Number(req.query.maxLat);
+    const minLon = Number(req.query.minLon);
+    const maxLon = Number(req.query.maxLon);
 
-    const size = Number(req.query.size);
-    const gridSizeMeters = Number(req.query.gridSizeMeters);
+    const safeCellSize = Number.isFinite(Number(req.query.cellSizeMeters)) && Number(req.query.cellSizeMeters) > 0
+      ? Number(req.query.cellSizeMeters)
+      : DEFAULT_CELL_SIZE_METERS;
 
-    if (!Number.isFinite(center.lat) || !Number.isFinite(center.lon)) {
+    if (
+      !Number.isFinite(minLat) ||
+      !Number.isFinite(maxLat) ||
+      !Number.isFinite(minLon) ||
+      !Number.isFinite(maxLon)
+    ) {
       return res.status(400).json({
         ok: false,
-        error: 'lat/lon are invalid'
+        error: 'viewport bounds are invalid'
       });
     }
 
-    if (!Number.isFinite(size) || size <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'size is invalid'
-      });
-    }
-
-    if (!Number.isFinite(gridSizeMeters) || gridSizeMeters <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'gridSizeMeters is invalid'
-      });
-    }
-
-    const cellKeys = [];
-    const keyToIndex = new Map();
-
-    for (let cellIndex = 0; cellIndex < size * size; cellIndex++) {
-      const cellKey = makeCellKey(center, size, gridSizeMeters, cellIndex);
-      cellKeys.push(cellKey);
-      keyToIndex.set(cellKey, cellIndex);
-    }
+    const range = boundsToGridRange(
+      minLat,
+      maxLat,
+      minLon,
+      maxLon,
+      safeCellSize
+    );
 
     const result = await pool.query(
       `
         select
-          co.cell_key,
-          co.owner_user_id,
+          gco.grid_x,
+          gco.grid_y,
+          gco.owner_user_id,
           u.telegram_id
-        from cell_ownership co
-        left join users u on u.id = co.owner_user_id
-        where co.cell_key = any($1::text[])
+        from global_cell_ownership gco
+        left join users u on u.id = gco.owner_user_id
+        where gco.grid_x between $1 and $2
+          and gco.grid_y between $3 and $4
       `,
-      [cellKeys]
+      [range.minGridX, range.maxGridX, range.minGridY, range.maxGridY]
     );
-
-    const cells = result.rows
-      .map((row) => ({
-        cellIndex: keyToIndex.get(row.cell_key),
-        ownerTelegramId: row.telegram_id
-      }))
-      .filter((row) => Number.isInteger(row.cellIndex));
 
     return res.json({
       ok: true,
-      center,
-      size,
-      gridSizeMeters,
-      cells
+      cellSizeMeters: safeCellSize,
+      bounds: {
+        minLat,
+        maxLat,
+        minLon,
+        maxLon
+      },
+      cells: result.rows.map((row) => ({
+        gridX: Number(row.grid_x),
+        gridY: Number(row.grid_y),
+        ownerTelegramId: row.telegram_id != null ? Number(row.telegram_id) : null
+      }))
     });
   } catch (error) {
-    console.error('map-state error:', error);
-
+    console.error('viewport map error:', error);
     return res.status(500).json({
       ok: false,
       error: error.message
@@ -592,83 +602,7 @@ app.get('/api/map/state', async (req, res) => {
 });
 
 // =========================================================
-// БЛОК 9. DB CHECK
-// =========================================================
-app.get('/api/db-check', async (_req, res) => {
-  try {
-    const result = await pool.query('select now() as now');
-
-    res.json({
-      ok: true,
-      db: 'connected',
-      now: result.rows[0].now
-    });
-  } catch (error) {
-    console.error('db-check error:', error);
-
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-// =========================================================
-// БЛОК 10. DB INIT
-// Временно. Потом лучше удалить.
-// =========================================================
-app.get('/api/db-init', async (_req, res) => {
-  try {
-    await pool.query(`
-      create table if not exists users (
-        id bigserial primary key,
-        telegram_id bigint unique not null,
-        username text,
-        first_name text,
-        last_name text,
-        created_at timestamptz default now()
-      );
-    `);
-
-    await pool.query(`
-      create table if not exists runs (
-        id bigserial primary key,
-        user_id bigint not null references users(id),
-        distance_meters integer not null default 0,
-        points_count integer not null default 0,
-        route_cells_count integer not null default 0,
-        captured_count integer not null default 0,
-        duration_seconds integer not null default 0,
-        started_at timestamptz,
-        finished_at timestamptz default now(),
-        created_at timestamptz default now()
-      );
-    `);
-
-    await pool.query(`
-      create table if not exists cell_ownership (
-        cell_key text primary key,
-        owner_user_id bigint references users(id),
-        updated_at timestamptz default now()
-      );
-    `);
-
-    res.json({
-      ok: true,
-      message: 'tables created'
-    });
-  } catch (error) {
-    console.error('db-init error:', error);
-
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    });
-  }
-});
-
-// =========================================================
-// БЛОК 11. СТАРТ СЕРВЕРА
+// БЛОК 9. СТАРТ СЕРВЕРА
 // =========================================================
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
