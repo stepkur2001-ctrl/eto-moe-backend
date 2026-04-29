@@ -163,7 +163,7 @@ function normalizePoints(points) {
 // БЛОК 3. ГЛОБАЛЬНАЯ СЕТКА ЧЕРЕЗ WEB MERCATOR
 // =========================================================
 const EARTH_RADIUS = 6378137;
-const DEFAULT_CELL_SIZE_METERS = 1000;
+const DEFAULT_CELL_SIZE_METERS = 500;
 
 function lonToMercatorX(lon) {
   return EARTH_RADIUS * (lon * Math.PI / 180);
