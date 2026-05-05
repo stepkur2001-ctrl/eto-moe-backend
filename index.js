@@ -568,7 +568,7 @@ app.get('/api/map/viewport', async (req, res) => {
           gco.grid_x,
           gco.grid_y,
           gco.owner_user_id,
-          u.telegram_id
+          u.telegram_id,
           u.username
         from global_cell_ownership gco
         left join users u on u.id = gco.owner_user_id
@@ -590,7 +590,7 @@ app.get('/api/map/viewport', async (req, res) => {
       cells: result.rows.map((row) => ({
         gridX: Number(row.grid_x),
         gridY: Number(row.grid_y),
-        ownerTelegramId: row.telegram_id != null ? Number(row.telegram_id) : null
+        ownerTelegramId: row.telegram_id != null ? Number(row.telegram_id) : null,
         ownerUsername: row.username ?? null
       }))
     });
