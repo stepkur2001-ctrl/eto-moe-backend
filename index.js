@@ -108,7 +108,7 @@ queryId: params.get('query_id') || null
 }
 
 // =========================================================
-// БЛОК 2. ОБЩАЯ МАТЕМАТИКА
+// БЛОК 2. ОБЩАЯ МАТЕМАТИКА + АНТИЧИТ
 // =========================================================
 function haversineMeters(lat1, lon1, lat2, lon2) {
 const R = 6371000;
@@ -157,6 +157,119 @@ p.lat <= 85 &&
 p.lon >= -180 &&
 p.lon <= 180
 );
+}
+
+const MAX_SEGMENT_SPEED_MPS = 7; // ~25 км/ч
+const MAX_AVG_SPEED_MPS = 5; // ~18 км/ч
+const MIN_RUN_DURATION_SECONDS = 120;
+const MIN_POINTS_COUNT = 5;
+const MAX_TELEPORT_DISTANCE_METERS = 250;
+
+function getSegmentStats(points) {
+const segments = [];
+
+for (let i = 1; i < points.length; i++) {
+const prev = points[i - 1];
+const curr = points[i];
+
+const distanceMeters = haversineMeters(
+prev.lat,
+prev.lon,
+curr.lat,
+curr.lon
+);
+
+const dtSeconds =
+prev.ts != null && curr.ts != null
+? (curr.ts - prev.ts) / 1000
+: null;
+
+let speedMps = null;
+
+if (dtSeconds != null && dtSeconds > 0) {
+speedMps = distanceMeters / dtSeconds;
+}
+
+segments.push({
+distanceMeters,
+dtSeconds,
+speedMps
+});
+}
+
+return segments;
+}
+
+function validateRunAsFoot(points, durationSeconds) {
+if (!Array.isArray(points) || points.length < MIN_POINTS_COUNT) {
+return {
+ok: false,
+error: 'Слишком мало точек для зачёта пробежки'
+};
+}
+
+if (!Number.isFinite(durationSeconds) || durationSeconds < MIN_RUN_DURATION_SECONDS) {
+return {
+ok: false,
+error: 'Пробежка слишком короткая для зачёта'
+};
+}
+
+const totalDistance = totalDistanceMeters(points);
+const avgSpeedMps = totalDistance / durationSeconds;
+
+if (avgSpeedMps > MAX_AVG_SPEED_MPS) {
+return {
+ok: false,
+error: 'Забег не засчитан: средняя скорость слишком высокая для бегового режима'
+};
+}
+
+const segments = getSegmentStats(points);
+
+let tooFastSegments = 0;
+let teleportSegments = 0;
+let measuredSegments = 0;
+
+for (const segment of segments) {
+if (!Number.isFinite(segment.dtSeconds) || segment.dtSeconds <= 0) {
+continue;
+}
+
+measuredSegments += 1;
+
+if (segment.distanceMeters > MAX_TELEPORT_DISTANCE_METERS && segment.dtSeconds < 10) {
+teleportSegments += 1;
+}
+
+if (Number.isFinite(segment.speedMps) && segment.speedMps > MAX_SEGMENT_SPEED_MPS) {
+tooFastSegments += 1;
+}
+}
+
+if (teleportSegments > 0) {
+return {
+ok: false,
+error: 'Забег не засчитан: обнаружены слишком резкие скачки координат'
+};
+}
+
+if (measuredSegments > 0) {
+const fastShare = tooFastSegments / measuredSegments;
+
+if (fastShare >= 0.25) {
+return {
+ok: false,
+error: 'Забег не засчитан: движение слишком быстрое для бегового режима'
+};
+}
+}
+
+return {
+ok: true,
+totalDistance,
+avgSpeedMps
+};
 }
 
 // =========================================================
@@ -408,15 +521,25 @@ error: 'points are missing or invalid'
 });
 }
 
+const runDurationSeconds = Number.isFinite(Number(durationSeconds))
+? Number(durationSeconds)
+: 0;
+
+const footValidation = validateRunAsFoot(safePoints, runDurationSeconds);
+
+if (!footValidation.ok) {
+return res.status(400).json({
+ok: false,
+error: footValidation.error
+});
+}
+
 const safeCellSize = Number.isFinite(Number(cellSizeMeters)) && Number(cellSizeMeters) > 0
 ? Number(cellSizeMeters)
 : DEFAULT_CELL_SIZE_METERS;
 
 const route = uniqueOrderedGlobalRoute(safePoints, safeCellSize);
-const distanceMeters = Math.round(totalDistanceMeters(safePoints));
-const runDurationSeconds = Number.isFinite(Number(durationSeconds))
-? Number(durationSeconds)
-: 0;
+const distanceMeters = Math.round(footValidation.totalDistance);
 
 await client.query('begin');
 
